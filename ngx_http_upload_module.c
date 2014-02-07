@@ -6,6 +6,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <string.h>
 #include <nginx.h>
 
 #if (NGX_HAVE_OPENSSL_MD5_H)
@@ -140,6 +141,7 @@ typedef struct {
     ngx_flag_t                    forward_args;
     ngx_flag_t                    tame_arrays;
     ngx_flag_t                    resumable_uploads;
+    ngx_array_t                   *resumable_headers;
     size_t                        limit_rate;
 
     unsigned int                  md5:1;
@@ -372,6 +374,37 @@ static ngx_int_t upload_parse_request_headers(ngx_http_upload_ctx_t *upload_ctx,
 static ngx_int_t upload_process_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
 static ngx_int_t upload_process_raw_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
 
+static char *
+ngx_http_upload_resumable_add_header(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_upload_loc_conf_t  *hcf = conf;
+    ngx_str_t                   *value;
+    ngx_table_elt_t             *header;
+
+    value = cf->args->elts;
+
+    if (hcf->resumable_headers == NULL) {
+        hcf->resumable_headers = ngx_array_create(cf->pool, 1, sizeof(ngx_table_elt_t));
+        if (hcf->resumable_headers == NULL) {
+            // error initializing header array...
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    header = ngx_array_push(hcf->resumable_headers);
+
+    if (header == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    header->key = value[1];
+    header->value = value[2];
+    header->hash = 1;
+
+    return NGX_CONF_OK;
+}
+
+
 static ngx_command_t  ngx_http_upload_commands[] = { /* {{{ */
 
     /*
@@ -575,8 +608,16 @@ static ngx_command_t  ngx_http_upload_commands[] = { /* {{{ */
        offsetof(ngx_http_upload_loc_conf_t, resumable_uploads),
        NULL },
 
+     { ngx_string("upload_resumable_add_header"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+       ngx_http_upload_resumable_add_header,
+       NGX_HTTP_LOC_CONF_OFFSET,
+       offsetof(ngx_http_upload_loc_conf_t, resumable_headers),
+       NULL },
+
       ngx_null_command
 }; /* }}} */
+
 
 ngx_http_module_t  ngx_http_upload_module_ctx = { /* {{{ */
     ngx_http_upload_add_variables,         /* preconfiguration */
@@ -766,13 +807,34 @@ static ngx_int_t ngx_http_upload_body_handler(ngx_http_request_t *r) { /* {{{ */
     ngx_uint_t                  flags;
     ngx_int_t                   rc;
     ngx_str_t                   uri;
-    ngx_buf_t                      *b;
-    ngx_chain_t                    *cl, out;
+    ngx_buf_t                   *b;
+    ngx_chain_t                 *cl, out;
     ngx_str_t                   dummy = ngx_string("<ngx_upload_module_dummy>");
     ngx_table_elt_t             *h;
+    ngx_table_elt_t             *custom_headers;
+    ngx_uint_t                  i;
 
     if(ctx->prevent_output) {
         r->headers_out.status = NGX_HTTP_CREATED;
+
+        /*
+         * Add custom headers
+         */
+        if (ulcf->resumable_headers && ulcf->resumable_headers->nelts > 0) {
+            custom_headers = ulcf->resumable_headers->elts;
+            for (i = 0; i < ulcf->resumable_headers->nelts; i++) {
+                h = ngx_list_push(&r->headers_out.headers);
+
+                if (h == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+
+                h = ngx_list_push(&r->headers_out.headers);
+                h->hash = 1;
+                h->key = custom_headers[i].key;
+                h->value = custom_headers[i].value;
+            }
+        }
 
         /*
          * Add range header and body
@@ -1683,7 +1745,6 @@ ngx_http_upload_merge_ranges(ngx_http_upload_ctx_t *u, ngx_http_upload_range_t *
     ngx_buf_t    out_buf;
     ngx_http_upload_loc_conf_t  *ulcf = ngx_http_get_module_loc_conf(u->request, ngx_http_upload_module);
     ngx_http_upload_range_t  range_to_merge_n;
-    
 
     state_file->fd = ngx_open_file(state_file->name.data, NGX_FILE_RDWR, NGX_FILE_CREATE_OR_OPEN, ulcf->store_access);
 
@@ -1773,6 +1834,11 @@ ngx_http_upload_merge_ranges(ngx_http_upload_ctx_t *u, ngx_http_upload_range_t *
 
     if(out_buf.file_pos < state_file->info.st_size) {
         result = ftruncate(state_file->fd, out_buf.file_pos);
+        if (result == -1) {
+            ngx_log_error(NGX_LOG_ERR, u->log, 0,
+                          "failed to truncate state file: \"%i\"", errno);
+            return NGX_ERROR;
+        }
     }
 
     rc = ms.complete_ranges ? NGX_OK : NGX_AGAIN;
@@ -1793,6 +1859,14 @@ ngx_http_upload_create_loc_conf(ngx_conf_t *cf)
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_upload_loc_conf_t));
     if (conf == NULL) {
         return NGX_CONF_ERROR;
+    }
+
+    if (conf->resumable_headers == NULL) {
+        conf->resumable_headers = ngx_array_create(cf->pool, 1, sizeof(ngx_table_elt_t));
+        if (conf->resumable_headers == NULL) {
+            // error initializing header array...
+            return NGX_CONF_ERROR;
+        }
     }
 
     conf->store_access = NGX_CONF_UNSET_UINT;
