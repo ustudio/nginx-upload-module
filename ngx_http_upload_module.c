@@ -374,17 +374,27 @@ static ngx_int_t upload_parse_request_headers(ngx_http_upload_ctx_t *upload_ctx,
 static ngx_int_t upload_process_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
 static ngx_int_t upload_process_raw_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
 
+
+typedef struct {
+    ngx_uint_t                  hash;
+    ngx_str_t                   key;
+    ngx_str_t                   simple_value;
+    ngx_http_complex_value_t    *complex_value;
+} ngx_upload_header_t;
+
+
 static char *
 ngx_http_upload_resumable_add_header(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_upload_loc_conf_t  *hcf = conf;
-    ngx_str_t                   *value;
-    ngx_table_elt_t             *header;
+    ngx_http_upload_loc_conf_t          *hcf = conf;
+    ngx_str_t                           *value;
+    ngx_upload_header_t                 *header;
+    ngx_http_compile_complex_value_t    complex_compile;
 
     value = cf->args->elts;
 
     if (hcf->resumable_headers == NULL) {
-        hcf->resumable_headers = ngx_array_create(cf->pool, 1, sizeof(ngx_table_elt_t));
+        hcf->resumable_headers = ngx_array_create(cf->pool, 1, sizeof(ngx_upload_header_t));
         if (hcf->resumable_headers == NULL) {
             // error initializing header array...
             return NGX_CONF_ERROR;
@@ -397,9 +407,30 @@ ngx_http_upload_resumable_add_header(ngx_conf_t *cf, ngx_command_t *cmd, void *c
         return NGX_CONF_ERROR;
     }
 
-    header->key = value[1];
-    header->value = value[2];
     header->hash = 1;
+    header->key = value[1];
+    header->simple_value = value[2];
+    header->complex_value = NULL;
+
+    if (ngx_http_script_variables_count(&value[2])) {
+        header->complex_value = ngx_palloc(
+            cf->pool, sizeof(ngx_http_complex_value_t));
+        if (header->complex_value == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        ngx_memzero(
+            &complex_compile,
+            sizeof(ngx_http_compile_complex_value_t));
+
+        complex_compile.cf = cf;
+        complex_compile.value = &value[2];
+        complex_compile.complex_value = header->complex_value;
+
+        if (ngx_http_compile_complex_value(&complex_compile) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
 
     return NGX_CONF_OK;
 }
@@ -811,30 +842,43 @@ static ngx_int_t ngx_http_upload_body_handler(ngx_http_request_t *r) { /* {{{ */
     ngx_chain_t                 *cl, out;
     ngx_str_t                   dummy = ngx_string("<ngx_upload_module_dummy>");
     ngx_table_elt_t             *h;
-    ngx_table_elt_t             *custom_headers;
+    ngx_upload_header_t         *custom_headers;
+    ngx_str_t                   custom_header_value;
     ngx_uint_t                  i;
+
+    /*
+     * Add custom headers
+     */
+    if (ulcf->resumable_headers && ulcf->resumable_headers->nelts > 0) {
+        custom_headers = ulcf->resumable_headers->elts;
+        for (i = 0; i < ulcf->resumable_headers->nelts; i++) {
+            h = ngx_list_push(&r->headers_out.headers);
+
+            if (h == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            h = ngx_list_push(&r->headers_out.headers);
+            h->hash = custom_headers[i].hash;
+            h->key = custom_headers[i].key;
+
+            if (custom_headers[i].complex_value == NULL) {
+                h->value = custom_headers[i].simple_value;
+            } else {
+                if (ngx_http_complex_value(
+                        r,
+                        custom_headers[i].complex_value,
+                        &custom_header_value) != NGX_OK) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                h->value.data = custom_header_value.data;
+                h->value.len = custom_header_value.len;
+            }
+        }
+    }
 
     if(ctx->prevent_output) {
         r->headers_out.status = NGX_HTTP_CREATED;
-
-        /*
-         * Add custom headers
-         */
-        if (ulcf->resumable_headers && ulcf->resumable_headers->nelts > 0) {
-            custom_headers = ulcf->resumable_headers->elts;
-            for (i = 0; i < ulcf->resumable_headers->nelts; i++) {
-                h = ngx_list_push(&r->headers_out.headers);
-
-                if (h == NULL) {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-                }
-
-                h = ngx_list_push(&r->headers_out.headers);
-                h->hash = 1;
-                h->key = custom_headers[i].key;
-                h->value = custom_headers[i].value;
-            }
-        }
 
         /*
          * Add range header and body
