@@ -412,7 +412,7 @@ ngx_http_upload_resumable_add_header(ngx_conf_t *cf, ngx_command_t *cmd, void *c
     header->simple_value = value[2];
     header->complex_value = NULL;
 
-    if (ngx_http_script_variables_count(&value[2])) {
+    if (ngx_http_script_variables_count(&(header->simple_value))) {
         header->complex_value = ngx_palloc(
             cf->pool, sizeof(ngx_http_complex_value_t));
         if (header->complex_value == NULL) {
@@ -424,7 +424,7 @@ ngx_http_upload_resumable_add_header(ngx_conf_t *cf, ngx_command_t *cmd, void *c
             sizeof(ngx_http_compile_complex_value_t));
 
         complex_compile.cf = cf;
-        complex_compile.value = &value[2];
+        complex_compile.value = &(value[2]);
         complex_compile.complex_value = header->complex_value;
 
         if (ngx_http_compile_complex_value(&complex_compile) != NGX_OK) {
@@ -871,7 +871,9 @@ static ngx_int_t ngx_http_upload_body_handler(ngx_http_request_t *r) { /* {{{ */
                         &custom_header_value) != NGX_OK) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                h->value.data = custom_header_value.data;
+                h->value.data = ngx_palloc(r->pool, custom_header_value.len + 1);
+                strncpy((char *)h->value.data, (char *)custom_header_value.data, custom_header_value.len);
+                h->value.data[custom_header_value.len] = '\0';
                 h->value.len = custom_header_value.len;
             }
         }
